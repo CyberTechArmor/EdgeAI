@@ -256,30 +256,18 @@ function Assert-Prerequisites {
         Install-LLVM
     }
 
-    # Visual Studio Build Tools -- needed for linker and Windows SDK.
-    # BitNet's setup_env.py passes "-T ClangCL" to cmake, which requires the
-    # ClangCL toolset installed as a VS component (not just standalone LLVM).
+    # Visual Studio Build Tools -- needed for linker and Windows SDK
     $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    $needsVs = $true
-    $needsClangCL = $true
     if (Test-Path $vsWhere) {
         $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
         if ($vsPath) {
-            $needsVs = $false
             Write-Ok "Visual Studio Build Tools found"
-            # Also verify the ClangCL toolset component is present
-            $clangCLPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset -property installationPath
-            if ($clangCLPath) {
-                $needsClangCL = $false
-                Write-Ok "ClangCL toolset found"
-            }
+        } else {
+            Write-Info "Installing Visual Studio Build Tools (for linker/SDK)..."
+            Install-VsBuildTools
         }
-    }
-    if ($needsVs) {
+    } else {
         Write-Info "Installing Visual Studio Build Tools (for linker/SDK)..."
-        Install-VsBuildTools
-    } elseif ($needsClangCL) {
-        Write-Info "Adding ClangCL toolset to existing VS Build Tools..."
         Install-VsBuildTools
     }
 
@@ -354,13 +342,9 @@ function Install-VsBuildTools {
 
     Invoke-DownloadWithProgress -Uri $installerUrl -OutFile $installerPath -Label "VS Build Tools installer"
 
-    # --includeRecommended covers most VCTools components but does NOT
-    # reliably include the ClangCL toolset, which BitNet's setup_env.py
-    # requires via "cmake -T ClangCL".  Add it explicitly.
     $proc = Start-Process -FilePath $installerPath -ArgumentList `
         "--quiet", "--wait", "--norestart",
         "--add", "Microsoft.VisualStudio.Workload.VCTools",
-        "--add", "Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset",
         "--includeRecommended" `
         -PassThru -NoNewWindow
     Wait-ProcessWithSpinner -Process $proc -Activity "Installing Visual Studio Build Tools"
@@ -437,14 +421,30 @@ function Build-BitNet {
     }
     Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "huggingface_hub") -LastLineOnly
 
+    # Ninja build system -- setup_env.py will be patched to use it instead of
+    # the VS ClangCL toolset (which requires a specific VS component that is
+    # unreliable to install). Standalone clang + Ninja is a well-tested combo.
+    Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "ninja") -LastLineOnly
+
     # Use BitNet's setup_env.py -- it handles: download model, generate
     # optimized kernels, cmake configure + build, and GGUF conversion.
     # --hf-repo must be a model from SUPPORTED_HF_MODELS (NOT the git URL).
     $setupScript = Join-Path $BITNET_DIR "setup_env.py"
     if (Test-Path $setupScript) {
-        # Refresh PATH so cmake can discover LLVM and the VS ClangCL toolset
-        # that may have been installed earlier in this session.
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+        # Refresh PATH and include venv Scripts (where ninja.exe lives) so
+        # cmake can discover both LLVM and Ninja.
+        $venvScripts = Join-Path $VENV_DIR "Scripts"
+        $env:Path = "$venvScripts;" + [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+
+        # Patch setup_env.py: replace "-T ClangCL" (requires a VS component
+        # that is unreliable to install) with "-G Ninja" (uses standalone
+        # clang already in PATH).
+        $setupContent = Get-Content $setupScript -Raw
+        if ($setupContent -match '-T.*ClangCL') {
+            Write-Info "Patching setup_env.py to use Ninja generator..."
+            $setupContent = $setupContent -replace '"\-T",\s*"ClangCL"', '"-G", "Ninja"'
+            Set-Content -Path $setupScript -Value $setupContent -NoNewline
+        }
 
         Write-Info "Running BitNet setup_env.py (download model + build)..."
         Write-Info "Model: $FALCON_HF_MODEL | Quantization: i2_s"
@@ -479,8 +479,7 @@ function Build-BitNet {
         $clangPath = (Get-Command clang -ErrorAction SilentlyContinue).Source
         if ($clangPath) {
             Write-Info "Using Clang at: $clangPath"
-            # Match setup_env.py cmake flags: -T ClangCL, -DBITNET_X86_TL2=OFF
-            Invoke-NativeCommand -FilePath "cmake" -Arguments @("..", "-T", "ClangCL", "-DBITNET_X86_TL2=OFF", "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++") -ShowOutput
+            Invoke-NativeCommand -FilePath "cmake" -Arguments @("..", "-G", "Ninja", "-DBITNET_X86_TL2=OFF", "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++", "-DCMAKE_BUILD_TYPE=Release") -ShowOutput
         } else {
             Write-Err "Clang not found in PATH. Please install LLVM and try again."
             Pop-Location
@@ -489,7 +488,7 @@ function Build-BitNet {
 
         $threadCount = [Math]::Max(1, [Environment]::ProcessorCount)
         Write-Info "Building with $threadCount parallel jobs..."
-        Invoke-NativeCommand -FilePath "cmake" -Arguments @("--build", ".", "--config", "Release", "-j", "$threadCount") -ShowOutput
+        Invoke-NativeCommand -FilePath "cmake" -Arguments @("--build", ".", "-j", "$threadCount") -ShowOutput
 
         Pop-Location
     }
