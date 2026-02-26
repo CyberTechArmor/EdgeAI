@@ -890,9 +890,17 @@ header {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── Configuration ──────────────────────────────────────────────
+# ── Log File (write everything to a file so errors survive window closes) ──
 
 $FRACTIONATE_HOME = Join-Path $env:USERPROFILE ".fractionate"
+if (-not (Test-Path $FRACTIONATE_HOME)) {
+    New-Item -ItemType Directory -Path $FRACTIONATE_HOME -Force | Out-Null
+}
+$LOG_FILE = Join-Path $FRACTIONATE_HOME "setup.log"
+# Start transcript — captures all output to the log file
+Start-Transcript -Path $LOG_FILE -Force | Out-Null
+
+# ── Configuration ──────────────────────────────────────────────
 $MODELS_DIR       = Join-Path $FRACTIONATE_HOME "models"
 $FALCON_DIR       = Join-Path $MODELS_DIR "falcon3-7b-1.58bit"
 $FLORENCE_DIR     = Join-Path $MODELS_DIR "florence-2-base"
@@ -922,12 +930,13 @@ function Assert-Admin {
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         Write-Warn "Not running as Administrator. Attempting to elevate..."
-        # Auto-elevate: re-launch as admin without prompting
+        # Auto-elevate: re-launch as admin with -NoExit so the window stays open on errors
         if ($PSCommandPath) {
-            Start-Process powershell.exe -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
+            Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoExit -ExecutionPolicy Bypass -File `"$PSCommandPath`""
         } else {
             Write-Err "Please run this script as Administrator."
             Write-Err "Right-click PowerShell -> Run as Administrator, then paste the script again."
+            Read-Host "Press Enter to close"
         }
         exit
     }
@@ -976,7 +985,7 @@ function Assert-Prerequisites {
             $minor = [int]$versionMatch.Groups[2].Value
             if ($major -lt 3 -or ($major -eq 3 -and $minor -lt 10)) {
                 Write-Err "Python 3.10+ is required. Found $pyVer"
-                exit 1
+                throw "Python 3.10+ is required. Found $pyVer"
             }
         }
     } else {
@@ -1045,12 +1054,12 @@ function Install-WithWinget {
             Write-Ok "$CommandName installed successfully"
         } else {
             Write-Err "Failed to install $CommandName. Please install manually and re-run this script."
-            exit 1
+            throw "Failed to install $CommandName"
         }
     } else {
         Write-Err "$CommandName is required but not found, and winget is not available."
         Write-Err "Please install $CommandName manually and re-run this script."
-        exit 1
+        throw "$CommandName is required but not found, and winget is not available"
     }
 }
 
@@ -1151,7 +1160,7 @@ function Build-BitNet {
         } else {
             Write-Err "Clang not found in PATH. Please install LLVM and try again."
             Pop-Location
-            exit 1
+            throw "Clang not found in PATH"
         }
 
         $threadCount = [Math]::Max(1, [Environment]::ProcessorCount)
@@ -1178,7 +1187,7 @@ function Build-BitNet {
 
     Write-Err "llama-server build failed. Check the build output above."
     Write-Err "You may need to build manually. See: https://github.com/microsoft/BitNet"
-    exit 1
+    throw "llama-server build failed"
 }
 
 # ── Model Downloads ────────────────────────────────────────────
@@ -1218,7 +1227,7 @@ snapshot_download(
         Write-Ok "Falcon model downloaded: $($modelFiles[0].Name) ($([math]::Round($modelFiles[0].Length / 1MB)) MB)"
     } else {
         Write-Err "Falcon model download failed."
-        exit 1
+        throw "Falcon model download failed"
     }
 }
 
@@ -1254,7 +1263,7 @@ print("Done!")
         Write-Ok "Florence-2 model downloaded"
     } else {
         Write-Err "Florence-2 model download failed."
-        exit 1
+        throw "Florence-2 model download failed"
     }
 }
 
@@ -1708,8 +1717,29 @@ processor.save_pretrained(r'$florenceDir')
     Write-Host ""
 }
 
-# Run
-Main
+# Run with error handling so the window never closes silently
+try {
+    Main
+} catch {
+    Write-Host ""
+    Write-Host "=========================================" -ForegroundColor Red
+    Write-Host "   Setup Failed!" -ForegroundColor Red
+    Write-Host "=========================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "   Error: $_" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "   Location: $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "   Full log saved to:" -ForegroundColor Gray
+    Write-Host "   $LOG_FILE" -ForegroundColor White
+    Write-Host ""
+} finally {
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+    Write-Host ""
+    Write-Host "Log file: $LOG_FILE" -ForegroundColor Gray
+    Write-Host ""
+    Read-Host "Press Enter to close this window"
+}
 
 } # End of scriptblock wrapper</script>
 
