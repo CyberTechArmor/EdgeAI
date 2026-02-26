@@ -42,12 +42,93 @@ $NGINX_URL        = "https://nginx.org/download/nginx-$NGINX_VERSION.zip"
 $FALCON_REPO      = "microsoft/Falcon3-7B-1.58bit-GGUF"
 $BITNET_REPO      = "https://github.com/microsoft/BitNet.git"
 
-# Colors
-function Write-Step    { param($msg) Write-Host "`n>> $msg" -ForegroundColor Cyan }
+# Colors and progress
+$script:StepNumber = 0
+$script:TotalSteps = 10
+
+function Write-Step {
+    param($msg)
+    $script:StepNumber++
+    $pct = [math]::Floor(($script:StepNumber / $script:TotalSteps) * 100)
+    Write-Host ""
+    Write-Host "[$script:StepNumber/$script:TotalSteps] $msg ($pct%)" -ForegroundColor Cyan
+    Write-Host ("=" * 50) -ForegroundColor DarkGray
+}
 function Write-Ok      { param($msg) Write-Host "   [OK] $msg" -ForegroundColor Green }
 function Write-Warn    { param($msg) Write-Host "   [WARN] $msg" -ForegroundColor Yellow }
 function Write-Err     { param($msg) Write-Host "   [ERROR] $msg" -ForegroundColor Red }
 function Write-Info    { param($msg) Write-Host "   $msg" -ForegroundColor Gray }
+
+function Format-Elapsed {
+    param([System.Diagnostics.Stopwatch]$sw)
+    $s = [math]::Floor($sw.Elapsed.TotalSeconds)
+    if ($s -ge 60) { return "$([math]::Floor($s/60))m $($s%60)s" }
+    return "${s}s"
+}
+
+function Wait-ProcessWithSpinner {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$Activity
+    )
+    $spinner = @('|', '/', '-', '\')
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $i = 0
+    while (-not $Process.HasExited) {
+        $t = Format-Elapsed $sw
+        Write-Host "`r   $($spinner[$i % 4]) $Activity... ($t)   " -NoNewline -ForegroundColor Yellow
+        Start-Sleep -Milliseconds 250
+        $i++
+    }
+    $sw.Stop()
+    $t = Format-Elapsed $sw
+    Write-Host "`r   [OK] $Activity ($t)          " -ForegroundColor Green
+}
+
+function Wait-JobWithSpinner {
+    param(
+        [System.Management.Automation.Job]$Job,
+        [string]$Activity
+    )
+    $spinner = @('|', '/', '-', '\')
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $i = 0
+    while ($Job.State -eq 'Running') {
+        $t = Format-Elapsed $sw
+        Write-Host "`r   $($spinner[$i % 4]) $Activity... ($t)   " -NoNewline -ForegroundColor Yellow
+        Start-Sleep -Milliseconds 500
+        $i++
+    }
+    $sw.Stop()
+    $t = Format-Elapsed $sw
+    Write-Host "`r   [OK] $Activity ($t)          " -ForegroundColor Green
+    return (Receive-Job -Job $Job -AutoRemoveJob -Wait)
+}
+
+function Invoke-DownloadWithProgress {
+    param(
+        [string]$Uri,
+        [string]$OutFile,
+        [string]$Label
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-Host "   - Downloading $Label..." -NoNewline -ForegroundColor Gray
+    try {
+        # Use BITS for large downloads (shows % in the console title)
+        $bitsSupported = Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue
+        if ($bitsSupported) {
+            Start-BitsTransfer -Source $Uri -Destination $OutFile -Description $Label
+        } else {
+            Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+        }
+    } catch {
+        # Fallback if BITS fails (e.g. HTTPS issues)
+        Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+    }
+    $t = Format-Elapsed $sw
+    $sizeMB = if (Test-Path $OutFile) { [math]::Round((Get-Item $OutFile).Length / 1MB) } else { "?" }
+    Write-Host " done (${sizeMB} MB, $t)" -ForegroundColor Green
+}
 
 # ── Elevation Check ────────────────────────────────────────────
 
@@ -98,7 +179,6 @@ function Test-RealPython {
 }
 
 function Assert-Prerequisites {
-    Write-Step "Checking prerequisites"
 
     # Python — must detect and skip the Windows Store alias
     if (Test-RealPython) {
@@ -140,7 +220,7 @@ function Assert-Prerequisites {
         Write-Ok "Clang found: $(clang --version | Select-Object -First 1)"
     } else {
         Write-Info "Clang not found. Installing LLVM..."
-        Install-WithWinget "LLVM.LLVM" "clang"
+        Install-LLVM
     }
 
     # Visual Studio Build Tools — needed for linker and Windows SDK
@@ -171,8 +251,8 @@ function Install-WithWinget {
     param([string]$PackageId, [string]$CommandName)
 
     if (Test-Command "winget") {
-        Write-Info "Installing $PackageId via winget..."
-        winget install --id $PackageId --accept-source-agreements --accept-package-agreements -e
+        Write-Info "Installing $PackageId via winget (silent)..."
+        winget install --id $PackageId --accept-source-agreements --accept-package-agreements --silent -e
         # Refresh PATH
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
         if (Test-Command $CommandName) {
@@ -188,28 +268,60 @@ function Install-WithWinget {
     }
 }
 
+function Install-LLVM {
+    # Use winget with --silent (forces NSIS /S flag so no GUI wizard pops up)
+    if (Test-Command "winget") {
+        Write-Info "Installing LLVM via winget (silent mode)..."
+        $llvmJob = Start-Job -ScriptBlock {
+            winget install --id LLVM.LLVM --accept-source-agreements --accept-package-agreements --silent -e 2>&1
+        }
+        Wait-JobWithSpinner -Job $llvmJob -Activity "Installing LLVM/Clang"
+    } else {
+        Write-Err "winget is required to install LLVM. Please install LLVM manually."
+        throw "Cannot install LLVM without winget"
+    }
+
+    # LLVM's silent installer does NOT add to PATH by default — fix that
+    $llvmBin = "$env:ProgramFiles\LLVM\bin"
+    if (Test-Path $llvmBin) {
+        $env:Path = "$llvmBin;$env:Path"
+        $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+        if ($machinePath -notlike "*LLVM*") {
+            [System.Environment]::SetEnvironmentVariable("Path", "$machinePath;$llvmBin", "Machine")
+            Write-Info "Added LLVM to system PATH"
+        }
+    }
+
+    # Refresh and verify
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+    if (Test-Command "clang") {
+        Write-Ok "LLVM/Clang installed: $(clang --version | Select-Object -First 1)"
+    } else {
+        Write-Err "LLVM installed but clang not found in PATH."
+        Write-Err "Expected at: $llvmBin\clang.exe"
+        throw "LLVM installation failed - clang not in PATH"
+    }
+}
+
 function Install-VsBuildTools {
     $installerUrl = "https://aka.ms/vs/17/release/vs_BuildTools.exe"
     $installerPath = Join-Path $env:TEMP "vs_BuildTools.exe"
 
-    Write-Info "Downloading Visual Studio Build Tools installer..."
-    Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
+    Invoke-DownloadWithProgress -Uri $installerUrl -OutFile $installerPath -Label "VS Build Tools installer"
 
-    Write-Info "Installing C++ Build Tools (this may take several minutes)..."
-    Start-Process -FilePath $installerPath -ArgumentList `
+    $proc = Start-Process -FilePath $installerPath -ArgumentList `
         "--quiet", "--wait", "--norestart",
         "--add", "Microsoft.VisualStudio.Workload.VCTools",
         "--includeRecommended" `
-        -Wait -NoNewWindow
+        -PassThru -NoNewWindow
+    Wait-ProcessWithSpinner -Process $proc -Activity "Installing Visual Studio Build Tools"
 
     Remove-Item $installerPath -ErrorAction SilentlyContinue
-    Write-Ok "Visual Studio Build Tools installed"
 }
 
 # ── Directory Structure ────────────────────────────────────────
 
 function Initialize-Directories {
-    Write-Step "Creating directory structure"
 
     $dirs = @($FRACTIONATE_HOME, $MODELS_DIR, $FALCON_DIR, $FLORENCE_DIR,
               $NGINX_DIR, $SERVER_DIR, $LOGS_DIR, $VENV_DIR)
@@ -227,7 +339,6 @@ function Initialize-Directories {
 # ── BitNet Build ───────────────────────────────────────────────
 
 function Build-BitNet {
-    Write-Step "Building BitNet (llama-server)"
 
     # Check multiple possible output paths
     $possiblePaths = @(
@@ -318,7 +429,6 @@ function Build-BitNet {
 # ── Model Downloads ────────────────────────────────────────────
 
 function Get-FalconModel {
-    Write-Step "Downloading Falcon3-7B 1.58-bit GGUF model"
 
     $modelFiles = Get-ChildItem -Path $FALCON_DIR -Filter "*.gguf" -ErrorAction SilentlyContinue
     if ($modelFiles.Count -gt 0) {
@@ -357,7 +467,6 @@ snapshot_download(
 }
 
 function Get-Florence2Model {
-    Write-Step "Downloading Florence-2-base model"
 
     $configFile = Join-Path $FLORENCE_DIR "config.json"
     if (Test-Path $configFile) {
@@ -395,7 +504,6 @@ print("Done!")
 # ── Python Virtual Environment ─────────────────────────────────
 
 function Initialize-PythonVenv {
-    Write-Step "Setting up Python virtual environment"
 
     $venvPython = Join-Path $VENV_DIR "Scripts\python.exe"
     if (Test-Path $venvPython) {
@@ -438,7 +546,6 @@ function Initialize-PythonVenv {
 # ── NGINX ──────────────────────────────────────────────────────
 
 function Install-Nginx {
-    Write-Step "Installing NGINX"
 
     $nginxExe = Join-Path $NGINX_DIR "nginx.exe"
     if (Test-Path $nginxExe) {
@@ -446,8 +553,7 @@ function Install-Nginx {
     } else {
         $zipPath = Join-Path $env:TEMP "nginx.zip"
 
-        Write-Info "Downloading NGINX $NGINX_VERSION..."
-        Invoke-WebRequest -Uri $NGINX_URL -OutFile $zipPath -UseBasicParsing
+        Invoke-DownloadWithProgress -Uri $NGINX_URL -OutFile $zipPath -Label "NGINX $NGINX_VERSION"
 
         Write-Info "Extracting..."
         $extractDir = Join-Path $env:TEMP "nginx-extract"
@@ -534,7 +640,6 @@ http {
 # ── Deploy Server Files ────────────────────────────────────────
 
 function Deploy-ServerFiles {
-    Write-Step "Deploying FastAPI server files"
 
     # Copy server files from the repo (if running from the repo directory)
     # Otherwise, they should be downloaded alongside this script
@@ -560,7 +665,6 @@ function Deploy-ServerFiles {
 # ── Configuration File ─────────────────────────────────────────
 
 function Initialize-Config {
-    Write-Step "Generating configuration"
 
     if (Test-Path $CONFIG_PATH) {
         Write-Ok "Configuration file already exists"
@@ -607,7 +711,6 @@ logging:
 # ── Task Scheduler ─────────────────────────────────────────────
 
 function Register-AutoStart {
-    Write-Step "Setting up auto-start on login"
 
     $venvPython = Join-Path $VENV_DIR "Scripts\python.exe"
     $nginxExe = Join-Path $NGINX_DIR "nginx.exe"
@@ -663,7 +766,6 @@ function Register-AutoStart {
 # ── Start Services ─────────────────────────────────────────────
 
 function Start-Services {
-    Write-Step "Starting services"
 
     $nginxExe = Join-Path $NGINX_DIR "nginx.exe"
     $venvPython = Join-Path $VENV_DIR "Scripts\python.exe"
@@ -695,7 +797,6 @@ function Start-Services {
 # ── Health Check ───────────────────────────────────────────────
 
 function Test-HealthCheck {
-    Write-Step "Running health check"
 
     $maxRetries = 10
     $retryDelay = 2
@@ -734,16 +835,32 @@ function Main {
     Write-Host "This script will install and configure the local AI backend."
     Write-Host "It will create files in: $FRACTIONATE_HOME"
     Write-Host ""
+    Write-Host "Steps: Admin > Prerequisites > Directories > Python venv >" -ForegroundColor DarkGray
+    Write-Host "       Model downloads > BitNet build > NGINX > Config >" -ForegroundColor DarkGray
+    Write-Host "       Auto-start > Launch services" -ForegroundColor DarkGray
+    Write-Host ""
 
     $startTime = Get-Date
+    $script:StepNumber = 0
 
+    # Step 1
+    Write-Step "Checking admin privileges"
     Assert-Admin
+
+    # Step 2
+    Write-Step "Installing prerequisites"
     Assert-Prerequisites
+
+    # Step 3
+    Write-Step "Creating directory structure"
     Initialize-Directories
+
+    # Step 4
+    Write-Step "Setting up Python virtual environment"
     Initialize-PythonVenv
 
-    # Start model downloads in parallel (biggest time savers)
-    Write-Step "Starting model downloads in background..."
+    # Step 5 — kick off model downloads in background
+    Write-Step "Starting model downloads (background)"
     $falconJob = Start-Job -ScriptBlock {
         param($venvDir, $falconDir, $falconRepo)
         $pipExe = Join-Path $venvDir "Scripts\pip.exe"
@@ -780,18 +897,19 @@ processor.save_pretrained(r'$florenceDir')
 
     Write-Ok "Model downloads running in background"
 
-    # Build BitNet while models download
+    # Step 6
+    Write-Step "Building BitNet (llama-server)"
     Build-BitNet
 
-    # Install NGINX while models may still be downloading
+    # Step 7
+    Write-Step "Installing NGINX + deploying server"
     Install-Nginx
     Deploy-ServerFiles
 
-    # Now wait for model downloads to finish
-    Write-Step "Waiting for model downloads to complete..."
+    # Step 8 — wait for background model downloads with spinners
+    Write-Step "Waiting for model downloads"
 
-    Write-Info "Waiting for Falcon3-7B download..."
-    $falconResult = Receive-Job -Job $falconJob -Wait -AutoRemoveJob
+    Wait-JobWithSpinner -Job $falconJob -Activity "Downloading Falcon3-7B (~1.7 GB)"
     $falconFiles = Get-ChildItem -Path $FALCON_DIR -Filter "*.gguf" -ErrorAction SilentlyContinue
     if ($falconFiles.Count -gt 0) {
         Write-Ok "Falcon3-7B ready: $($falconFiles[0].Name) ($([math]::Round($falconFiles[0].Length / 1MB)) MB)"
@@ -799,16 +917,20 @@ processor.save_pretrained(r'$florenceDir')
         Write-Err "Falcon model download failed. Run the script again to retry."
     }
 
-    Write-Info "Waiting for Florence-2 download..."
-    $florenceResult = Receive-Job -Job $florenceJob -Wait -AutoRemoveJob
+    Wait-JobWithSpinner -Job $florenceJob -Activity "Downloading Florence-2-base"
     if (Test-Path (Join-Path $FLORENCE_DIR "config.json")) {
         Write-Ok "Florence-2 ready"
     } else {
         Write-Err "Florence-2 download failed. Run the script again to retry."
     }
 
+    # Step 9
+    Write-Step "Configuring system"
     Initialize-Config
     Register-AutoStart
+
+    # Step 10
+    Write-Step "Launching services"
     Start-Services
     $healthy = Test-HealthCheck
 
