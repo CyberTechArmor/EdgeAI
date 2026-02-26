@@ -1,11 +1,16 @@
 # Fractionate Edge — Windows Setup Script
-# Usage: irm https://edge.fractionate.ai/setup-windows.ps1 | iex
+# Usage:
+#   Option 1: Save as setup-windows.ps1, then: powershell -ExecutionPolicy Bypass -File setup-windows.ps1
+#   Option 2: Copy entire script, paste into PowerShell as Administrator, press Enter
 #
 # This script is idempotent — safe to run multiple times.
 # It installs all dependencies, downloads models, configures services,
 # and starts the local AI backend.
 
 #Requires -Version 5.1
+
+# Wrap everything in a scriptblock so paste-into-PowerShell executes correctly
+& {
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -60,14 +65,36 @@ function Test-Command {
     return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Test-RealPython {
+    # Windows has Store alias stubs for python.exe that open the Microsoft Store
+    # instead of running Python. Detect and skip those.
+    try {
+        $cmd = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $cmd) { return $false }
+
+        # Check if the python.exe is a Windows Store alias (AppExecAlias)
+        if ($cmd.Source -and $cmd.Source -match 'WindowsApps') {
+            return $false
+        }
+
+        # Actually try to run it — Store alias triggers an error or opens Store
+        $result = & python --version 2>&1
+        if ($LASTEXITCODE -ne 0) { return $false }
+        if ($result -match 'Python \d+\.\d+') { return $true }
+        return $false
+    } catch {
+        return $false
+    }
+}
+
 function Assert-Prerequisites {
     Write-Step "Checking prerequisites"
 
-    # Python
-    if (Test-Command "python") {
+    # Python — must detect and skip the Windows Store alias
+    if (Test-RealPython) {
         $pyVer = & python --version 2>&1
         Write-Ok "Python found: $pyVer"
-        $versionMatch = [regex]::Match($pyVer, '(\d+)\.(\d+)')
+        $versionMatch = [regex]::Match("$pyVer", '(\d+)\.(\d+)')
         if ($versionMatch.Success) {
             $major = [int]$versionMatch.Groups[1].Value
             $minor = [int]$versionMatch.Groups[2].Value
@@ -77,7 +104,8 @@ function Assert-Prerequisites {
             }
         }
     } else {
-        Write-Info "Python not found. Attempting to install via winget..."
+        Write-Info "Python not found (or only the Windows Store alias is present)."
+        Write-Info "Attempting to install Python 3.12 via winget..."
         Install-WithWinget "Python.Python.3.12" "python"
     }
 
@@ -703,3 +731,5 @@ function Main {
 
 # Run
 Main
+
+} # End of scriptblock wrapper
