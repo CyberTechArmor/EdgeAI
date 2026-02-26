@@ -809,7 +809,7 @@ header {
           <h3 style="font-size: 14px; font-weight: 600; margin-bottom: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px;">Windows Setup</h3>
 
           <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 12px; line-height: 1.5;">
-            Open <strong>PowerShell as Administrator</strong>, then either save and run the script file, or paste the full script directly.
+            Open <strong>PowerShell as Administrator</strong>, then use one of these options:
           </p>
 
           <div class="install-actions">
@@ -817,20 +817,22 @@ header {
               <span class="install-action-icon">&#11015;</span>
               <span>
                 <span class="install-action-label">Download setup-windows.ps1</span>
-                <span class="install-action-desc">Save the file, then right-click &rarr; Run with PowerShell</span>
+                <span class="install-action-desc">Save, then: powershell -ExecutionPolicy Bypass -File setup-windows.ps1</span>
               </span>
             </button>
-            <button class="install-action-btn" onclick="copySetupScript(this)">
+            <button class="install-action-btn" onclick="copyRunCommand(this)">
               <span class="install-action-icon">&#128203;</span>
               <span>
-                <span class="install-action-label">Copy Full Script to Clipboard</span>
-                <span class="install-action-desc">Paste into PowerShell and press Enter</span>
+                <span class="install-action-label">Copy Run Command</span>
+                <span class="install-action-desc">After downloading, paste this into Admin PowerShell</span>
               </span>
             </button>
           </div>
 
+          <div class="oneliner-preview" style="margin-top: 8px; padding: 10px 12px; background: var(--bg-tertiary); border-radius: 6px; font-family: monospace; font-size: 12px; word-break: break-all; color: var(--text-secondary); display: none;" id="onelinerPreview"></div>
+
           <details class="script-preview">
-            <summary>Preview setup script</summary>
+            <summary>Preview full setup script</summary>
             <pre id="scriptPreviewCode"></pre>
           </details>
 
@@ -874,19 +876,11 @@ header {
 
 <!-- PowerShell setup script embedded as plain text (not executed by browser) -->
 <script id="setup-script-content" type="text/plain"># Fractionate Edge -- Windows Setup Script
-# Usage:
-#   Option 1: Save as setup-windows.ps1, then: powershell -ExecutionPolicy Bypass -File setup-windows.ps1
-#   Option 2: Copy entire script, paste into PowerShell as Administrator, press Enter
+# Usage: powershell -ExecutionPolicy Bypass -File setup-windows.ps1
 #
 # This script is idempotent -- safe to run multiple times.
 # It installs all dependencies, downloads models, configures services,
 # and starts the local AI backend.
-
-#Requires -Version 5.1
-
-# When pasting into PowerShell, the entire block executes as one unit because
-# the opening & { doesn't close until the matching } at the end of the file.
-& {
 
 $ErrorActionPreference = "Stop"
 
@@ -1931,9 +1925,7 @@ try {
     Write-Host "Log file: $LOG_FILE" -ForegroundColor Gray
     Write-Host ""
     Read-Host "Press Enter to close this window"
-}
-
-} # End of scriptblock wrapper</script>
+}</script>
 
 <script>
 // ── Configuration ──────────────────────────────────
@@ -2567,12 +2559,18 @@ function downloadSetupScript() {
   URL.revokeObjectURL(url);
 }
 
-function copySetupScript(button) {
-  navigator.clipboard.writeText(SETUP_SCRIPT).then(() => {
+function copyRunCommand(button) {
+  const cmd = 'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\setup-windows.ps1"';
+  navigator.clipboard.writeText(cmd).then(() => {
     const label = button.querySelector(".install-action-label");
     const origText = label.textContent;
-    label.textContent = "Copied to clipboard!";
+    label.textContent = "Copied!";
     button.classList.add("copied");
+    const preview = document.getElementById("onelinerPreview");
+    if (preview) {
+      preview.textContent = cmd;
+      preview.style.display = "block";
+    }
     setTimeout(() => {
       label.textContent = origText;
       button.classList.remove("copied");
