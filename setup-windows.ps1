@@ -1,31 +1,31 @@
-# Fractionate Edge — Windows Setup Script
+# Fractionate Edge -- Windows Setup Script
 # Usage:
 #   Option 1: Save as setup-windows.ps1, then: powershell -ExecutionPolicy Bypass -File setup-windows.ps1
 #   Option 2: Copy entire script, paste into PowerShell as Administrator, press Enter
 #
-# This script is idempotent — safe to run multiple times.
+# This script is idempotent -- safe to run multiple times.
 # It installs all dependencies, downloads models, configures services,
 # and starts the local AI backend.
 
 #Requires -Version 5.1
 
-# Wrap everything in a scriptblock so paste-into-PowerShell executes correctly
+# When pasting into PowerShell, the entire block executes as one unit because
+# the opening & { doesn't close until the matching } at the end of the file.
 & {
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── Log File (write everything to a file so errors survive window closes) ──
+# -- Log File (write everything to a file so errors survive window closes) --
 
 $FRACTIONATE_HOME = Join-Path $env:USERPROFILE ".fractionate"
 if (-not (Test-Path $FRACTIONATE_HOME)) {
     New-Item -ItemType Directory -Path $FRACTIONATE_HOME -Force | Out-Null
 }
 $LOG_FILE = Join-Path $FRACTIONATE_HOME "setup.log"
-# Start transcript — captures all output to the log file
+# Start transcript -- captures all output to the log file
 Start-Transcript -Path $LOG_FILE -Force | Out-Null
 
-# ── Configuration ──────────────────────────────────────────────
+# -- Configuration ----------------------------------------------
 $MODELS_DIR       = Join-Path $FRACTIONATE_HOME "models"
 $FALCON_DIR       = Join-Path $MODELS_DIR "falcon3-7b-1.58bit"
 $FLORENCE_DIR     = Join-Path $MODELS_DIR "florence-2-base"
@@ -44,15 +44,15 @@ $FALCON_HF_MODEL  = "tiiuae/Falcon3-7B-1.58bit"           # must match BitNet SU
 $BITNET_REPO      = "https://github.com/microsoft/BitNet.git"
 
 # Colors and progress
-$script:StepNumber = 0
-$script:TotalSteps = 10
+$global:_StepNumber = 0
+$global:_TotalSteps = 10
 
 function Write-Step {
     param($msg)
-    $script:StepNumber++
-    $pct = [math]::Floor(($script:StepNumber / $script:TotalSteps) * 100)
+    $global:_StepNumber++
+    $pct = [math]::Floor(($global:_StepNumber / $global:_TotalSteps) * 100)
     Write-Host ""
-    Write-Host "[$script:StepNumber/$script:TotalSteps] $msg ($pct%)" -ForegroundColor Cyan
+    Write-Host "[$global:_StepNumber/$global:_TotalSteps] $msg ($pct%)" -ForegroundColor Cyan
     Write-Host ("=" * 50) -ForegroundColor DarkGray
 }
 function Write-Ok      { param($msg) Write-Host "   [OK] $msg" -ForegroundColor Green }
@@ -161,7 +161,7 @@ function Invoke-NativeCommand {
     Write-Host " done (${sizeMB} MB, $t)" -ForegroundColor Green
 }
 
-# ── Elevation Check ────────────────────────────────────────────
+# -- Elevation Check --------------------------------------------
 
 function Assert-Admin {
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -180,7 +180,7 @@ function Assert-Admin {
     Write-Ok "Running as Administrator"
 }
 
-# ── Prerequisite Checks ───────────────────────────────────────
+# -- Prerequisite Checks ---------------------------------------
 
 function Test-Command {
     param([string]$Name)
@@ -199,7 +199,7 @@ function Test-RealPython {
             return $false
         }
 
-        # Actually try to run it — Store alias triggers an error or opens Store
+        # Actually try to run it -- Store alias triggers an error or opens Store
         $result = & python --version 2>&1
         if ($LASTEXITCODE -ne 0) { return $false }
         if ($result -match 'Python \d+\.\d+') { return $true }
@@ -211,7 +211,7 @@ function Test-RealPython {
 
 function Assert-Prerequisites {
 
-    # Python — must detect and skip the Windows Store alias
+    # Python -- must detect and skip the Windows Store alias
     if (Test-RealPython) {
         $pyVer = & python --version 2>&1
         Write-Ok "Python found: $pyVer"
@@ -246,7 +246,7 @@ function Assert-Prerequisites {
         Install-WithWinget "Kitware.CMake" "cmake"
     }
 
-    # Clang — BitNet requires Clang or GCC, NOT MSVC
+    # Clang -- BitNet requires Clang or GCC, NOT MSVC
     if (Test-Command "clang") {
         Write-Ok "Clang found: $(clang --version | Select-Object -First 1)"
     } else {
@@ -254,7 +254,7 @@ function Assert-Prerequisites {
         Install-LLVM
     }
 
-    # Visual Studio Build Tools — needed for linker and Windows SDK
+    # Visual Studio Build Tools -- needed for linker and Windows SDK
     $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path $vsWhere) {
         $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -312,7 +312,7 @@ function Install-LLVM {
         throw "Cannot install LLVM without winget"
     }
 
-    # LLVM's silent installer does NOT add to PATH by default — fix that
+    # LLVM's silent installer does NOT add to PATH by default -- fix that
     $llvmBin = "$env:ProgramFiles\LLVM\bin"
     if (Test-Path $llvmBin) {
         $env:Path = "$llvmBin;$env:Path"
@@ -350,7 +350,7 @@ function Install-VsBuildTools {
     Remove-Item $installerPath -ErrorAction SilentlyContinue
 }
 
-# ── Directory Structure ────────────────────────────────────────
+# -- Directory Structure ----------------------------------------
 
 function Initialize-Directories {
 
@@ -367,7 +367,7 @@ function Initialize-Directories {
     Write-Ok "Directory structure ready"
 }
 
-# ── BitNet Build ───────────────────────────────────────────────
+# -- BitNet Build -----------------------------------------------
 
 function Build-BitNet {
 
@@ -410,7 +410,7 @@ function Build-BitNet {
     }
     Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "huggingface_hub") -LastLineOnly
 
-    # Use BitNet's setup_env.py — it handles: download model, generate
+    # Use BitNet's setup_env.py -- it handles: download model, generate
     # optimized kernels, cmake configure + build, and GGUF conversion.
     # --hf-repo must be a model from SUPPORTED_HF_MODELS (NOT the git URL).
     $setupScript = Join-Path $BITNET_DIR "setup_env.py"
@@ -483,7 +483,7 @@ function Build-BitNet {
     throw "llama-server build failed"
 }
 
-# ── Model Downloads ────────────────────────────────────────────
+# -- Model Downloads --------------------------------------------
 
 function Get-FalconModel {
 
@@ -558,7 +558,7 @@ print("Done!")
     }
 }
 
-# ── Python Virtual Environment ─────────────────────────────────
+# -- Python Virtual Environment ---------------------------------
 
 function Initialize-PythonVenv {
 
@@ -605,7 +605,7 @@ function Initialize-PythonVenv {
     Write-Ok "Python dependencies installed"
 }
 
-# ── NGINX ──────────────────────────────────────────────────────
+# -- NGINX ------------------------------------------------------
 
 function Install-Nginx {
 
@@ -644,7 +644,7 @@ function Install-Nginx {
     $corsOrigin = "https://edge.fractionate.ai"
 
     $nginxConf = @"
-# Fractionate Edge — NGINX Configuration (auto-generated)
+# Fractionate Edge -- NGINX Configuration (auto-generated)
 worker_processes 1;
 
 events {
@@ -699,7 +699,7 @@ http {
     Write-Ok "NGINX configuration generated"
 }
 
-# ── Deploy Server Files ────────────────────────────────────────
+# -- Deploy Server Files ----------------------------------------
 
 function Deploy-ServerFiles {
 
@@ -724,7 +724,7 @@ function Deploy-ServerFiles {
     Write-Ok "Server files deployed"
 }
 
-# ── Configuration File ─────────────────────────────────────────
+# -- Configuration File -----------------------------------------
 
 function Initialize-Config {
 
@@ -770,7 +770,7 @@ logging:
     Write-Ok "Configuration file generated"
 }
 
-# ── Task Scheduler ─────────────────────────────────────────────
+# -- Task Scheduler ---------------------------------------------
 
 function Register-AutoStart {
 
@@ -825,7 +825,7 @@ function Register-AutoStart {
     }
 }
 
-# ── Start Services ─────────────────────────────────────────────
+# -- Start Services ---------------------------------------------
 
 function Start-Services {
 
@@ -856,7 +856,7 @@ function Start-Services {
     Write-Ok "FastAPI started on 127.0.0.1:8081"
 }
 
-# ── Health Check ───────────────────────────────────────────────
+# -- Health Check -----------------------------------------------
 
 function Test-HealthCheck {
 
@@ -886,12 +886,12 @@ function Test-HealthCheck {
     return $false
 }
 
-# ── Main ───────────────────────────────────────────────────────
+# -- Main -------------------------------------------------------
 
 function Main {
     Write-Host ""
     Write-Host "=========================================" -ForegroundColor Cyan
-    Write-Host "   Fractionate Edge — Windows Setup" -ForegroundColor Cyan
+    Write-Host "   Fractionate Edge -- Windows Setup" -ForegroundColor Cyan
     Write-Host "=========================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "This script will install and configure the local AI backend."
@@ -903,7 +903,7 @@ function Main {
     Write-Host ""
 
     $startTime = Get-Date
-    $script:StepNumber = 0
+    $global:_StepNumber = 0
 
     # Step 1
     Write-Step "Checking admin privileges"
@@ -921,7 +921,7 @@ function Main {
     Write-Step "Setting up Python virtual environment"
     Initialize-PythonVenv
 
-    # Step 5 — kick off Florence-2 download in background while we build BitNet
+    # Step 5 -- kick off Florence-2 download in background while we build BitNet
     Write-Step "Starting Florence-2 download (background)"
     $florenceJob = Start-Job -ScriptBlock {
         param($venvDir, $florenceDir)
@@ -945,7 +945,7 @@ processor.save_pretrained(r'$florenceDir')
     } -ArgumentList $VENV_DIR, $FLORENCE_DIR
     Write-Ok "Florence-2 download running in background"
 
-    # Step 6 — BitNet: downloads Falcon model, generates kernels, builds llama-server
+    # Step 6 -- BitNet: downloads Falcon model, generates kernels, builds llama-server
     Write-Step "Building BitNet + downloading Falcon3-7B model"
     Build-BitNet
 
@@ -972,7 +972,7 @@ processor.save_pretrained(r'$florenceDir')
     Install-Nginx
     Deploy-ServerFiles
 
-    # Step 8 — wait for any remaining downloads
+    # Step 8 -- wait for any remaining downloads
     Write-Step "Waiting for model downloads"
 
     if ($falconJob) {
