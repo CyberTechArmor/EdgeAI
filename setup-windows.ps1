@@ -256,18 +256,30 @@ function Assert-Prerequisites {
         Install-LLVM
     }
 
-    # Visual Studio Build Tools -- needed for linker and Windows SDK
+    # Visual Studio Build Tools -- needed for linker and Windows SDK.
+    # BitNet's setup_env.py passes "-T ClangCL" to cmake, which requires the
+    # ClangCL toolset installed as a VS component (not just standalone LLVM).
     $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    $needsVs = $true
+    $needsClangCL = $true
     if (Test-Path $vsWhere) {
         $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
         if ($vsPath) {
+            $needsVs = $false
             Write-Ok "Visual Studio Build Tools found"
-        } else {
-            Write-Info "Installing Visual Studio Build Tools (for linker/SDK)..."
-            Install-VsBuildTools
+            # Also verify the ClangCL toolset component is present
+            $clangCLPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset -property installationPath
+            if ($clangCLPath) {
+                $needsClangCL = $false
+                Write-Ok "ClangCL toolset found"
+            }
         }
-    } else {
+    }
+    if ($needsVs) {
         Write-Info "Installing Visual Studio Build Tools (for linker/SDK)..."
+        Install-VsBuildTools
+    } elseif ($needsClangCL) {
+        Write-Info "Adding ClangCL toolset to existing VS Build Tools..."
         Install-VsBuildTools
     }
 
