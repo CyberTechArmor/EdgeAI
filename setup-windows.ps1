@@ -94,7 +94,11 @@ function Wait-JobWithSpinner {
     }
     $sw.Stop()
     $t = Format-Elapsed $sw
-    Write-Host "`r   [OK] $Activity ($t)          " -ForegroundColor Green
+    if ($Job.State -eq 'Failed') {
+        Write-Host "`r   [ERROR] $Activity failed ($t)          " -ForegroundColor Red
+    } else {
+        Write-Host "`r   [OK] $Activity ($t)          " -ForegroundColor Green
+    }
     return (Receive-Job -Job $Job -AutoRemoveJob -Wait)
 }
 
@@ -129,6 +133,8 @@ function Invoke-NativeCommand {
         $ErrorActionPreference = $prevEAP
     }
 }
+
+function Invoke-DownloadWithProgress {
     param(
         [string]$Uri,
         [string]$OutFile,
@@ -275,7 +281,7 @@ function Install-WithWinget {
 
     if (Test-Command "winget") {
         Write-Info "Installing $PackageId via winget (silent)..."
-        winget install --id $PackageId --accept-source-agreements --accept-package-agreements --silent -e
+        Invoke-NativeCommand -FilePath "winget" -Arguments @("install", "--id", $PackageId, "--accept-source-agreements", "--accept-package-agreements", "--silent", "-e") -LastLineOnly
         # Refresh PATH
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
         if (Test-Command $CommandName) {
@@ -379,11 +385,11 @@ function Build-BitNet {
     # Clone
     if (-not (Test-Path (Join-Path $BITNET_DIR ".git"))) {
         Write-Info "Cloning BitNet repository..."
-        git clone --recursive $BITNET_REPO $BITNET_DIR
+        Invoke-NativeCommand -FilePath "git" -Arguments @("clone", "--recursive", $BITNET_REPO, $BITNET_DIR) -ShowOutput
     } else {
         Write-Info "BitNet repo exists, pulling latest..."
         Push-Location $BITNET_DIR
-        git pull
+        Invoke-NativeCommand -FilePath "git" -Arguments @("pull") -LastLineOnly
         Pop-Location
     }
 
@@ -475,81 +481,6 @@ function Build-BitNet {
     throw "llama-server build failed"
 }
 
-# -- Model Downloads --------------------------------------------
-
-function Get-FalconModel {
-
-    $modelFiles = Get-ChildItem -Path $FALCON_DIR -Filter "*.gguf" -ErrorAction SilentlyContinue
-    if ($modelFiles.Count -gt 0) {
-        Write-Ok "Falcon model already downloaded: $($modelFiles[0].Name)"
-        return
-    }
-
-    Write-Info "Downloading from HuggingFace ($FALCON_REPO)..."
-    Write-Info "This is ~1.7 GB and may take a few minutes."
-
-    # Use huggingface-cli if available, otherwise direct download
-    if (Test-Command "huggingface-cli") {
-        & huggingface-cli download $FALCON_REPO --local-dir $FALCON_DIR --include "*.gguf"
-    } else {
-        # Install huggingface_hub and use it
-        & (Join-Path $VENV_DIR "Scripts\pip.exe") install huggingface_hub 2>$null
-
-        $downloadScript = @"
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id="$FALCON_REPO",
-    local_dir=r"$FALCON_DIR",
-    allow_patterns=["*.gguf"]
-)
-"@
-        & (Join-Path $VENV_DIR "Scripts\python.exe") -c $downloadScript
-    }
-
-    $modelFiles = Get-ChildItem -Path $FALCON_DIR -Filter "*.gguf" -ErrorAction SilentlyContinue
-    if ($modelFiles.Count -gt 0) {
-        Write-Ok "Falcon model downloaded: $($modelFiles[0].Name) ($([math]::Round($modelFiles[0].Length / 1MB)) MB)"
-    } else {
-        Write-Err "Falcon model download failed."
-        throw "Falcon model download failed"
-    }
-}
-
-function Get-Florence2Model {
-
-    $configFile = Join-Path $FLORENCE_DIR "config.json"
-    if (Test-Path $configFile) {
-        Write-Ok "Florence-2 model already downloaded"
-        return
-    }
-
-    Write-Info "Downloading Florence-2-base from HuggingFace..."
-    Write-Info "This may take a few minutes."
-
-    $downloadScript = @"
-from transformers import AutoProcessor, AutoModelForCausalLM
-import os
-
-model_path = r"$FLORENCE_DIR"
-print("Downloading Florence-2-base model...")
-model = AutoModelForCausalLM.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
-processor = AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
-
-print("Saving model to", model_path)
-model.save_pretrained(model_path)
-processor.save_pretrained(model_path)
-print("Done!")
-"@
-    & (Join-Path $VENV_DIR "Scripts\python.exe") -c $downloadScript
-
-    if (Test-Path $configFile) {
-        Write-Ok "Florence-2 model downloaded"
-    } else {
-        Write-Err "Florence-2 model download failed."
-        throw "Florence-2 model download failed"
-    }
-}
-
 # -- Python Virtual Environment ---------------------------------
 
 function Initialize-PythonVenv {
@@ -559,7 +490,7 @@ function Initialize-PythonVenv {
         Write-Ok "Virtual environment exists"
     } else {
         Write-Info "Creating virtual environment..."
-        & python -m venv $VENV_DIR
+        Invoke-NativeCommand -FilePath "python" -Arguments @("-m", "venv", $VENV_DIR) -LastLineOnly
         Write-Ok "Virtual environment created"
     }
 
@@ -687,7 +618,8 @@ http {
 }
 "@
 
-    $nginxConf | Out-File -FilePath (Join-Path $confDir "nginx.conf") -Encoding UTF8 -Force
+    # Use WriteAllText to avoid UTF-8 BOM that PS5.1 Out-File adds (breaks NGINX)
+    [IO.File]::WriteAllText((Join-Path $confDir "nginx.conf"), $nginxConf)
     Write-Ok "NGINX configuration generated"
 }
 
@@ -758,7 +690,8 @@ logging:
   path: "$($LOGS_DIR -replace '\\', '/')"
 "@
 
-    $configYaml | Out-File -FilePath $CONFIG_PATH -Encoding UTF8 -Force
+    # Use WriteAllText to avoid UTF-8 BOM that PS5.1 Out-File adds
+    [IO.File]::WriteAllText($CONFIG_PATH, $configYaml)
     Write-Ok "Configuration file generated"
 }
 
@@ -830,22 +763,24 @@ function Start-Services {
     if ($nginxProc) {
         Write-Info "NGINX is already running"
     } else {
-        Push-Location $NGINX_DIR
-        Start-Process -FilePath $nginxExe -WindowStyle Hidden
-        Pop-Location
+        Start-Process -FilePath $nginxExe -WorkingDirectory $NGINX_DIR -WindowStyle Hidden
         Start-Sleep -Seconds 1
         Write-Ok "NGINX started on 127.0.0.1:8080"
     }
 
-    # Start FastAPI
+    # Start FastAPI (check if port 8081 is already in use)
     Write-Info "Starting FastAPI backend..."
-    $env:FRACTIONATE_HOME = $FRACTIONATE_HOME
-    Push-Location $SERVER_DIR
-    Start-Process -FilePath $venvPython -ArgumentList "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8081" `
-        -WindowStyle Hidden
-    Pop-Location
-    Start-Sleep -Seconds 2
-    Write-Ok "FastAPI started on 127.0.0.1:8081"
+    $portInUse = Get-NetTCPConnection -LocalPort 8081 -ErrorAction SilentlyContinue
+    if ($portInUse) {
+        Write-Info "FastAPI is already running on port 8081"
+    } else {
+        $env:FRACTIONATE_HOME = $FRACTIONATE_HOME
+        Start-Process -FilePath $venvPython -WorkingDirectory $SERVER_DIR `
+            -ArgumentList "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8081" `
+            -WindowStyle Hidden
+        Start-Sleep -Seconds 2
+        Write-Ok "FastAPI started on 127.0.0.1:8081"
+    }
 }
 
 # -- Health Check -----------------------------------------------
