@@ -981,7 +981,37 @@ function Wait-JobWithSpinner {
     return (Receive-Job -Job $Job -AutoRemoveJob -Wait)
 }
 
-function Invoke-DownloadWithProgress {
+function Invoke-NativeCommand {
+    # Run an external command with stderr merged into stdout without triggering
+    # PowerShell's ErrorActionPreference=Stop on stderr lines.
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [switch]$ShowOutput,
+        [switch]$LastLineOnly,
+        [string]$FilterPattern
+    )
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        if ($ShowOutput) {
+            & $FilePath @Arguments 2>&1 | ForEach-Object {
+                $line = $_.ToString()
+                if ($FilterPattern) {
+                    if ($line -match $FilterPattern) { Write-Info $line }
+                } else {
+                    Write-Info $line
+                }
+            }
+        } elseif ($LastLineOnly) {
+            & $FilePath @Arguments 2>&1 | Select-Object -Last 1 | ForEach-Object { Write-Info $_.ToString() }
+        } else {
+            & $FilePath @Arguments 2>&1 | Out-Null
+        }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+}
     param(
         [string]$Uri,
         [string]$OutFile,
@@ -1247,13 +1277,13 @@ function Build-BitNet {
     $ggufPy = Join-Path $BITNET_DIR "3rdparty\llama.cpp\gguf-py"
     if (Test-Path $ggufPy) {
         Write-Info "Installing BitNet Python dependencies..."
-        & $pipExe install -e $ggufPy 2>&1 | Select-Object -Last 1 | ForEach-Object { Write-Info $_ }
+        Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "-e", $ggufPy) -LastLineOnly
     }
     $bitnetReqs = Join-Path $BITNET_DIR "requirements.txt"
     if (Test-Path $bitnetReqs) {
-        & $pipExe install -r $bitnetReqs 2>&1 | Select-Object -Last 1 | ForEach-Object { Write-Info $_ }
+        Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "-r", $bitnetReqs) -LastLineOnly
     }
-    & $pipExe install huggingface_hub 2>&1 | Select-Object -Last 1 | ForEach-Object { Write-Info $_ }
+    Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "huggingface_hub") -LastLineOnly
 
     # Use BitNet's setup_env.py — it handles: download model, generate
     # optimized kernels, cmake configure + build, and GGUF conversion.
@@ -1263,13 +1293,8 @@ function Build-BitNet {
         Write-Info "Running BitNet setup_env.py (download model + build)..."
         Write-Info "Model: $FALCON_HF_MODEL | Quantization: i2_s"
         Push-Location $BITNET_DIR
-        & $venvPython setup_env.py --hf-repo $FALCON_HF_MODEL -q i2_s 2>&1 | ForEach-Object {
-            $line = $_.ToString()
-            # Show meaningful lines, suppress noise
-            if ($line -match '(Downloading|Converting|Compiling|Building|cmake|error|warning|100%)') {
-                Write-Info $line
-            }
-        }
+        Invoke-NativeCommand -FilePath $venvPython -Arguments @("setup_env.py", "--hf-repo", $FALCON_HF_MODEL, "-q", "i2_s") `
+            -ShowOutput -FilterPattern '(Downloading|Converting|Compiling|Building|cmake|error|warning|100%|INFO|model)'
         Pop-Location
 
         # setup_env.py places the GGUF model under bitnet/models/
@@ -1299,7 +1324,7 @@ function Build-BitNet {
         if ($clangPath) {
             Write-Info "Using Clang at: $clangPath"
             # Match setup_env.py cmake flags: -T ClangCL, -DBITNET_X86_TL2=OFF
-            cmake .. -T ClangCL -DBITNET_X86_TL2=OFF -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ 2>&1 | ForEach-Object { Write-Info $_ }
+            Invoke-NativeCommand -FilePath "cmake" -Arguments @("..", "-T", "ClangCL", "-DBITNET_X86_TL2=OFF", "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++") -ShowOutput
         } else {
             Write-Err "Clang not found in PATH. Please install LLVM and try again."
             Pop-Location
@@ -1308,7 +1333,7 @@ function Build-BitNet {
 
         $threadCount = [Math]::Max(1, [Environment]::ProcessorCount)
         Write-Info "Building with $threadCount parallel jobs..."
-        cmake --build . --config Release -j $threadCount 2>&1 | ForEach-Object { Write-Info $_ }
+        Invoke-NativeCommand -FilePath "cmake" -Arguments @("--build", ".", "--config", "Release", "-j", "$threadCount") -ShowOutput
 
         Pop-Location
     }
@@ -1422,29 +1447,34 @@ function Initialize-PythonVenv {
     }
 
     Write-Info "Installing Python dependencies..."
+    $venvPython = Join-Path $VENV_DIR "Scripts\python.exe"
     $pipExe = Join-Path $VENV_DIR "Scripts\pip.exe"
-    & $pipExe install --upgrade pip
+
+    # Use python -m pip for self-upgrade (pip.exe cannot overwrite itself on Windows)
+    Invoke-NativeCommand -FilePath $venvPython -Arguments @("-m", "pip", "install", "--upgrade", "pip") -LastLineOnly
 
     # Install from requirements.txt if available, otherwise install directly
     $reqFile = Join-Path $SERVER_DIR "requirements.txt"
     if (Test-Path $reqFile) {
-        & $pipExe install -r $reqFile
+        Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "-r", $reqFile) -LastLineOnly
     } else {
-        & $pipExe install `
-            "fastapi>=0.104.0" `
-            "uvicorn[standard]>=0.24.0" `
-            "transformers>=4.36.0" `
-            "torch>=2.1.0" `
-            "torchvision>=0.16.0" `
-            "pillow>=10.0.0" `
-            "python-multipart>=0.0.6" `
-            "aiosqlite>=0.19.0" `
-            "httpx>=0.25.0" `
-            "sse-starlette>=1.8.0" `
-            "PyMuPDF>=1.23.0" `
-            "python-docx>=1.0.0" `
-            "pyyaml>=6.0" `
+        Invoke-NativeCommand -FilePath $pipExe -Arguments @(
+            "install",
+            "fastapi>=0.104.0",
+            "uvicorn[standard]>=0.24.0",
+            "transformers>=4.36.0",
+            "torch>=2.1.0",
+            "torchvision>=0.16.0",
+            "pillow>=10.0.0",
+            "python-multipart>=0.0.6",
+            "aiosqlite>=0.19.0",
+            "httpx>=0.25.0",
+            "sse-starlette>=1.8.0",
+            "PyMuPDF>=1.23.0",
+            "python-docx>=1.0.0",
+            "pyyaml>=6.0",
             "psutil>=5.9.0"
+        ) -LastLineOnly
     }
 
     Write-Ok "Python dependencies installed"
