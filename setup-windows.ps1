@@ -1,17 +1,9 @@
 # Fractionate Edge -- Windows Setup Script
-# Usage:
-#   Option 1: Save as setup-windows.ps1, then: powershell -ExecutionPolicy Bypass -File setup-windows.ps1
-#   Option 2: Copy entire script, paste into PowerShell as Administrator, press Enter
+# Usage: powershell -ExecutionPolicy Bypass -File setup-windows.ps1
 #
 # This script is idempotent -- safe to run multiple times.
 # It installs all dependencies, downloads models, configures services,
 # and starts the local AI backend.
-
-#Requires -Version 5.1
-
-# When pasting into PowerShell, the entire block executes as one unit because
-# the opening & { doesn't close until the matching } at the end of the file.
-& {
 
 $ErrorActionPreference = "Stop"
 
@@ -1057,5 +1049,3 @@ try {
     Write-Host ""
     Read-Host "Press Enter to close this window"
 }
-
-} # End of scriptblock wrapper
