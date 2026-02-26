@@ -414,7 +414,7 @@ function Build-BitNet {
         Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "-e", $ggufPy) -LastLineOnly -IgnoreExitCode
     }
     # Verify gguf is importable; install from PyPI if not
-    $ggufCheck = & $venvPython -c "import gguf" 2>&1
+    Invoke-NativeCommand -FilePath $venvPython -Arguments @("-c", "import gguf") -IgnoreExitCode
     if ($LASTEXITCODE -ne 0) {
         Write-Info "Installing gguf from PyPI as fallback..."
         Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "gguf") -LastLineOnly
