@@ -46,16 +46,17 @@ function Write-Info    { param($msg) Write-Host "   $msg" -ForegroundColor Gray 
 function Assert-Admin {
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Warn "This script works best with Administrator privileges."
-        Write-Warn "Some steps (like installing build tools) may require elevation."
-        Write-Host ""
-        $response = Read-Host "Continue without admin? (y/N)"
-        if ($response -ne "y" -and $response -ne "Y") {
-            Write-Host "Re-launching as Administrator..."
+        Write-Warn "Not running as Administrator. Attempting to elevate..."
+        # Auto-elevate: re-launch as admin without prompting
+        if ($PSCommandPath) {
             Start-Process powershell.exe -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
-            exit
+        } else {
+            Write-Err "Please run this script as Administrator."
+            Write-Err "Right-click PowerShell -> Run as Administrator, then paste the script again."
         }
+        exit
     }
+    Write-Ok "Running as Administrator"
 }
 
 # ── Prerequisite Checks ───────────────────────────────────────
@@ -125,20 +126,26 @@ function Assert-Prerequisites {
         Install-WithWinget "Kitware.CMake" "cmake"
     }
 
-    # Check for C++ compiler (MSVC)
+    # Clang — BitNet requires Clang or GCC, NOT MSVC
+    if (Test-Command "clang") {
+        Write-Ok "Clang found: $(clang --version | Select-Object -First 1)"
+    } else {
+        Write-Info "Clang not found. Installing LLVM..."
+        Install-WithWinget "LLVM.LLVM" "clang"
+    }
+
+    # Visual Studio Build Tools — needed for linker and Windows SDK
     $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path $vsWhere) {
         $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
         if ($vsPath) {
-            Write-Ok "Visual Studio Build Tools found: $vsPath"
+            Write-Ok "Visual Studio Build Tools found"
         } else {
-            Write-Warn "Visual Studio found but C++ tools not installed."
-            Write-Info "Installing C++ Build Tools..."
+            Write-Info "Installing Visual Studio Build Tools (for linker/SDK)..."
             Install-VsBuildTools
         }
     } else {
-        Write-Warn "Visual Studio Build Tools not found."
-        Write-Info "Installing Visual Studio Build Tools..."
+        Write-Info "Installing Visual Studio Build Tools (for linker/SDK)..."
         Install-VsBuildTools
     }
 
@@ -213,10 +220,17 @@ function Initialize-Directories {
 function Build-BitNet {
     Write-Step "Building BitNet (llama-server)"
 
-    $llamaServer = Join-Path $BITNET_DIR "build\bin\Release\llama-server.exe"
-    if (Test-Path $llamaServer) {
-        Write-Ok "llama-server already built: $llamaServer"
-        return
+    # Check multiple possible output paths
+    $possiblePaths = @(
+        (Join-Path $BITNET_DIR "build\bin\Release\llama-server.exe"),
+        (Join-Path $BITNET_DIR "build\bin\llama-server.exe"),
+        (Join-Path $BITNET_DIR "build\Release\bin\llama-server.exe")
+    )
+    foreach ($p in $possiblePaths) {
+        if (Test-Path $p) {
+            Write-Ok "llama-server already built: $p"
+            return
+        }
     }
 
     # Clone
@@ -230,37 +244,66 @@ function Build-BitNet {
         Pop-Location
     }
 
-    # Build
-    Write-Info "Configuring CMake build..."
-    $buildDir = Join-Path $BITNET_DIR "build"
-    if (-not (Test-Path $buildDir)) {
-        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
-    }
-
-    Push-Location $buildDir
-
-    # Find vcvarsall.bat for MSVC environment
-    $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-
-    Write-Info "Building with CMake (this may take several minutes)..."
-    cmake .. -DCMAKE_BUILD_TYPE=Release
-    cmake --build . --config Release --target llama-server -j $([Math]::Max(1, [Environment]::ProcessorCount / 2))
-
-    Pop-Location
-
-    if (Test-Path $llamaServer) {
-        Write-Ok "llama-server built successfully"
+    # Check if BitNet has its own setup script (preferred method)
+    $setupScript = Join-Path $BITNET_DIR "setup_env.py"
+    if (Test-Path $setupScript) {
+        Write-Info "Using BitNet's own setup_env.py (this may take several minutes)..."
+        $venvPython = Join-Path $VENV_DIR "Scripts\python.exe"
+        Push-Location $BITNET_DIR
+        & $venvPython setup_env.py --hf-repo microsoft/BitNet -q i2_s 2>&1 | ForEach-Object { Write-Info $_ }
+        Pop-Location
     } else {
-        # Try alternate path
-        $altPath = Join-Path $BITNET_DIR "build\bin\llama-server.exe"
-        if (Test-Path $altPath) {
-            Write-Ok "llama-server built successfully (alternate path)"
+        # Manual CMake build with Clang (BitNet REQUIRES Clang or GCC, not MSVC)
+        Write-Info "Configuring CMake build with Clang..."
+        $buildDir = Join-Path $BITNET_DIR "build"
+        if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force }
+        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+
+        Push-Location $buildDir
+
+        # Use ClangCL toolset with Visual Studio generator (Clang frontend, MSVC linker)
+        $clangPath = (Get-Command clang -ErrorAction SilentlyContinue).Source
+        if ($clangPath) {
+            Write-Info "Using Clang at: $clangPath"
+            cmake .. -T ClangCL -DCMAKE_BUILD_TYPE=Release 2>&1 | ForEach-Object { Write-Info $_ }
+            if ($LASTEXITCODE -ne 0) {
+                # Fallback: explicit compiler paths
+                Write-Info "Retrying with explicit Clang compiler paths..."
+                $clangDir = Split-Path $clangPath
+                $clangxx = Join-Path $clangDir "clang++.exe"
+                cmake .. -DCMAKE_C_COMPILER="$clangPath" -DCMAKE_CXX_COMPILER="$clangxx" -DCMAKE_BUILD_TYPE=Release 2>&1 | ForEach-Object { Write-Info $_ }
+            }
         } else {
-            Write-Err "llama-server build failed. Check build output above."
+            Write-Err "Clang not found in PATH. Please install LLVM and try again."
+            Pop-Location
             exit 1
         }
+
+        $threadCount = [Math]::Max(1, [Environment]::ProcessorCount)
+        Write-Info "Building with $threadCount parallel jobs (this may take several minutes)..."
+        cmake --build . --config Release --target llama-server -j $threadCount 2>&1 | ForEach-Object { Write-Info $_ }
+
+        Pop-Location
     }
+
+    # Verify build output
+    foreach ($p in $possiblePaths) {
+        if (Test-Path $p) {
+            Write-Ok "llama-server built successfully: $p"
+            return
+        }
+    }
+
+    # Also search recursively as a last resort
+    $found = Get-ChildItem -Path $BITNET_DIR -Recurse -Filter "llama-server.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) {
+        Write-Ok "llama-server built successfully: $($found.FullName)"
+        return
+    }
+
+    Write-Err "llama-server build failed. Check the build output above."
+    Write-Err "You may need to build manually. See: https://github.com/microsoft/BitNet"
+    exit 1
 }
 
 # ── Model Downloads ────────────────────────────────────────────
@@ -689,11 +732,72 @@ function Main {
     Assert-Prerequisites
     Initialize-Directories
     Initialize-PythonVenv
+
+    # Start model downloads in parallel (biggest time savers)
+    Write-Step "Starting model downloads in background..."
+    $falconJob = Start-Job -ScriptBlock {
+        param($venvDir, $falconDir, $falconRepo)
+        $pipExe = Join-Path $venvDir "Scripts\pip.exe"
+        $pythonExe = Join-Path $venvDir "Scripts\python.exe"
+
+        # Check if already downloaded
+        $existing = Get-ChildItem -Path $falconDir -Filter "*.gguf" -ErrorAction SilentlyContinue
+        if ($existing.Count -gt 0) { return "already_exists" }
+
+        & $pipExe install huggingface_hub 2>$null
+        $script = "from huggingface_hub import snapshot_download; snapshot_download(repo_id='$falconRepo', local_dir=r'$falconDir', allow_patterns=['*.gguf'])"
+        & $pythonExe -c $script
+        return "downloaded"
+    } -ArgumentList $VENV_DIR, $FALCON_DIR, $FALCON_REPO
+
+    $florenceJob = Start-Job -ScriptBlock {
+        param($venvDir, $florenceDir)
+        $pythonExe = Join-Path $venvDir "Scripts\python.exe"
+
+        # Check if already downloaded
+        $configFile = Join-Path $florenceDir "config.json"
+        if (Test-Path $configFile) { return "already_exists" }
+
+        $script = @"
+from transformers import AutoProcessor, AutoModelForCausalLM
+model = AutoModelForCausalLM.from_pretrained('microsoft/Florence-2-base', trust_remote_code=True)
+processor = AutoProcessor.from_pretrained('microsoft/Florence-2-base', trust_remote_code=True)
+model.save_pretrained(r'$florenceDir')
+processor.save_pretrained(r'$florenceDir')
+"@
+        & $pythonExe -c $script
+        return "downloaded"
+    } -ArgumentList $VENV_DIR, $FLORENCE_DIR
+
+    Write-Ok "Model downloads running in background"
+
+    # Build BitNet while models download
     Build-BitNet
-    Get-FalconModel
-    Get-Florence2Model
+
+    # Install NGINX while models may still be downloading
     Install-Nginx
     Deploy-ServerFiles
+
+    # Now wait for model downloads to finish
+    Write-Step "Waiting for model downloads to complete..."
+
+    Write-Info "Waiting for Falcon3-7B download..."
+    $falconResult = Receive-Job -Job $falconJob -Wait -AutoRemoveJob
+    $falconFiles = Get-ChildItem -Path $FALCON_DIR -Filter "*.gguf" -ErrorAction SilentlyContinue
+    if ($falconFiles.Count -gt 0) {
+        Write-Ok "Falcon3-7B ready: $($falconFiles[0].Name) ($([math]::Round($falconFiles[0].Length / 1MB)) MB)"
+    } else {
+        Write-Err "Falcon model download failed. Run the script again to retry."
+    }
+
+    Write-Info "Waiting for Florence-2 download..."
+    $florenceResult = Receive-Job -Job $florenceJob -Wait -AutoRemoveJob
+    if (Test-Path (Join-Path $FLORENCE_DIR "config.json")) {
+        Write-Ok "Florence-2 ready"
+    } else {
+        Write-Err "Florence-2 download failed. Run the script again to retry."
+    }
+
     Initialize-Config
     Register-AutoStart
     Start-Services

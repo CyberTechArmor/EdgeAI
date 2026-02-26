@@ -65,11 +65,25 @@ FALCON_MODEL_PATH = os.path.expanduser(
 FALCON_CONTEXT_SIZE = falcon_cfg.get("context_size", 4096)
 FALCON_AUTO_START = falcon_cfg.get("auto_start", False)
 
-# Determine llama-server binary path based on platform
-if platform.system() == "Windows":
-    LLAMA_BINARY = str(BASE_DIR / "bitnet" / "build" / "bin" / "Release" / "llama-server.exe")
-else:
-    LLAMA_BINARY = str(BASE_DIR / "bitnet" / "build" / "bin" / "llama-server")
+# Determine llama-server binary path — search multiple possible build output locations
+def _find_llama_binary() -> str:
+    ext = ".exe" if platform.system() == "Windows" else ""
+    candidates = [
+        BASE_DIR / "bitnet" / "build" / "bin" / "Release" / f"llama-server{ext}",
+        BASE_DIR / "bitnet" / "build" / "bin" / f"llama-server{ext}",
+        BASE_DIR / "bitnet" / "build" / "Release" / "bin" / f"llama-server{ext}",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    # Recursive search as last resort
+    bitnet_dir = BASE_DIR / "bitnet"
+    if bitnet_dir.exists():
+        for match in bitnet_dir.rglob(f"llama-server{ext}"):
+            return str(match)
+    return str(candidates[0])  # Default path even if not found yet
+
+LLAMA_BINARY = _find_llama_binary()
 
 FLORENCE_MODEL_PATH = os.path.expanduser(
     florence_cfg.get("path", str(BASE_DIR / "models" / "florence-2-base"))
