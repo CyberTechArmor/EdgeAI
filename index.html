@@ -1015,7 +1015,7 @@ function Assert-Prerequisites {
         Write-Ok "Clang found: $(clang --version | Select-Object -First 1)"
     } else {
         Write-Info "Clang not found. Installing LLVM..."
-        Install-WithWinget "LLVM.LLVM" "clang"
+        Install-LLVM
     }
 
     # Visual Studio Build Tools — needed for linker and Windows SDK
@@ -1046,8 +1046,8 @@ function Install-WithWinget {
     param([string]$PackageId, [string]$CommandName)
 
     if (Test-Command "winget") {
-        Write-Info "Installing $PackageId via winget..."
-        winget install --id $PackageId --accept-source-agreements --accept-package-agreements -e
+        Write-Info "Installing $PackageId via winget (silent)..."
+        winget install --id $PackageId --accept-source-agreements --accept-package-agreements --silent -e
         # Refresh PATH
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
         if (Test-Command $CommandName) {
@@ -1060,6 +1060,45 @@ function Install-WithWinget {
         Write-Err "$CommandName is required but not found, and winget is not available."
         Write-Err "Please install $CommandName manually and re-run this script."
         throw "$CommandName is required but not found, and winget is not available"
+    }
+}
+
+function Install-LLVM {
+    # LLVM's NSIS installer often opens a GUI even with winget, so download and
+    # run with /S (NSIS silent flag) directly. Also set ADD_TO_PATH.
+    $llvmVersion = "18.1.8"
+    $llvmUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvmVersion/LLVM-$llvmVersion-win64.exe"
+    $installerPath = Join-Path $env:TEMP "LLVM-installer.exe"
+
+    Write-Info "Downloading LLVM $llvmVersion (this is ~350 MB)..."
+    Invoke-WebRequest -Uri $llvmUrl -OutFile $installerPath -UseBasicParsing
+
+    Write-Info "Installing LLVM silently (this may take a minute)..."
+    # /S = NSIS silent, /D= sets install dir (no space after /D=)
+    $llvmInstallDir = "$env:ProgramFiles\LLVM"
+    Start-Process -FilePath $installerPath -ArgumentList "/S", "/D=$llvmInstallDir" -Wait -NoNewWindow
+
+    Remove-Item $installerPath -ErrorAction SilentlyContinue
+
+    # Add LLVM to PATH for this session and permanently
+    $llvmBin = Join-Path $llvmInstallDir "bin"
+    if (Test-Path $llvmBin) {
+        $env:Path = "$llvmBin;$env:Path"
+        # Also add to system PATH permanently so future sessions find it
+        $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+        if ($machinePath -notlike "*$llvmBin*") {
+            [System.Environment]::SetEnvironmentVariable("Path", "$machinePath;$llvmBin", "Machine")
+        }
+    }
+
+    # Refresh and verify
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+    if (Test-Command "clang") {
+        Write-Ok "LLVM/Clang installed: $(clang --version | Select-Object -First 1)"
+    } else {
+        Write-Err "LLVM installed but clang not found in PATH."
+        Write-Err "Expected at: $llvmBin\clang.exe"
+        throw "LLVM installation failed - clang not in PATH"
     }
 }
 
