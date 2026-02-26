@@ -1,0 +1,23 @@
+# Fractionate Edge — Default Configuration
+# Location: %USERPROFILE%\.fractionate\config.yaml (Windows)
+#            ~/.fractionate/config.yaml (macOS/Linux)
+
+mode: development
+cors_origin: "http://localhost:3000"
+
+models:
+  falcon3_7b:
+    path: "~/.fractionate/models/falcon3-7b-1.58bit/model.gguf"
+    auto_start: true
+    threads: auto       # "auto" = physical cores / 2
+    context_size: 4096
+  florence2:
+    path: "~/.fractionate/models/florence-2-base/"
+    auto_load: false    # Load on demand when a document is uploaded
+
+database:
+  path: "~/.fractionate/data.db"
+
+logging:
+  level: "info"
+  path: "~/.fractionate/logs/"
