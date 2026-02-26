@@ -342,9 +342,13 @@ function Install-VsBuildTools {
 
     Invoke-DownloadWithProgress -Uri $installerUrl -OutFile $installerPath -Label "VS Build Tools installer"
 
+    # --includeRecommended covers most VCTools components but does NOT
+    # reliably include the ClangCL toolset, which BitNet's setup_env.py
+    # requires via "cmake -T ClangCL".  Add it explicitly.
     $proc = Start-Process -FilePath $installerPath -ArgumentList `
         "--quiet", "--wait", "--norestart",
         "--add", "Microsoft.VisualStudio.Workload.VCTools",
+        "--add", "Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset",
         "--includeRecommended" `
         -PassThru -NoNewWindow
     Wait-ProcessWithSpinner -Process $proc -Activity "Installing Visual Studio Build Tools"
@@ -414,7 +418,7 @@ function Build-BitNet {
         Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "-e", $ggufPy) -LastLineOnly -IgnoreExitCode
     }
     # Verify gguf is importable; install from PyPI if not
-    $ggufCheck = & $venvPython -c "import gguf" 2>&1
+    Invoke-NativeCommand -FilePath $venvPython -Arguments @("-c", "import gguf") -IgnoreExitCode
     if ($LASTEXITCODE -ne 0) {
         Write-Info "Installing gguf from PyPI as fallback..."
         Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "gguf") -LastLineOnly
@@ -426,6 +430,10 @@ function Build-BitNet {
     # --hf-repo must be a model from SUPPORTED_HF_MODELS (NOT the git URL).
     $setupScript = Join-Path $BITNET_DIR "setup_env.py"
     if (Test-Path $setupScript) {
+        # Refresh PATH so cmake can discover LLVM and the VS ClangCL toolset
+        # that may have been installed earlier in this session.
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+
         Write-Info "Running BitNet setup_env.py (download model + build)..."
         Write-Info "Model: $FALCON_HF_MODEL | Quantization: i2_s"
         Push-Location $BITNET_DIR
