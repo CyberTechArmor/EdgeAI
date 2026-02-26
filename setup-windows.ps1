@@ -129,6 +129,8 @@ function Invoke-NativeCommand {
         $ErrorActionPreference = $prevEAP
     }
 }
+
+function Invoke-DownloadWithProgress {
     param(
         [string]$Uri,
         [string]$OutFile,
