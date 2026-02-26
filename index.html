@@ -987,7 +987,8 @@ function Invoke-NativeCommand {
         [string[]]$Arguments = @(),
         [switch]$ShowOutput,
         [switch]$LastLineOnly,
-        [string]$FilterPattern
+        [string]$FilterPattern,
+        [switch]$IgnoreExitCode
     )
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
@@ -1008,6 +1009,9 @@ function Invoke-NativeCommand {
         }
     } finally {
         $ErrorActionPreference = $prevEAP
+    }
+    if (-not $IgnoreExitCode -and $LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
     }
 }
 
@@ -1158,7 +1162,7 @@ function Install-WithWinget {
 
     if (Test-Command "winget") {
         Write-Info "Installing $PackageId via winget (silent)..."
-        Invoke-NativeCommand -FilePath "winget" -Arguments @("install", "--id", $PackageId, "--accept-source-agreements", "--accept-package-agreements", "--silent", "-e") -LastLineOnly
+        Invoke-NativeCommand -FilePath "winget" -Arguments @("install", "--id", $PackageId, "--accept-source-agreements", "--accept-package-agreements", "--silent", "-e") -LastLineOnly -IgnoreExitCode
         # Refresh PATH
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
         if (Test-Command $CommandName) {
@@ -1266,22 +1270,31 @@ function Build-BitNet {
     } else {
         Write-Info "BitNet repo exists, pulling latest..."
         Push-Location $BITNET_DIR
-        Invoke-NativeCommand -FilePath "git" -Arguments @("pull") -LastLineOnly
+        Invoke-NativeCommand -FilePath "git" -Arguments @("pull") -LastLineOnly -IgnoreExitCode
         Pop-Location
     }
+
+    # Ensure submodules are initialized (critical: setup_env.py needs 3rdparty/llama.cpp)
+    Write-Info "Updating git submodules..."
+    Push-Location $BITNET_DIR
+    Invoke-NativeCommand -FilePath "git" -Arguments @("submodule", "update", "--init", "--recursive") -LastLineOnly
+    Pop-Location
 
     $venvPython = Join-Path $VENV_DIR "Scripts\python.exe"
     $pipExe = Join-Path $VENV_DIR "Scripts\pip.exe"
 
-    # Install BitNet's own Python dependencies (gguf-py, huggingface-cli)
+    # Pre-install gguf-py so setup_env.py's internal pip install finds it.
+    # Try the submodule path first; fall back to PyPI if it's broken.
     $ggufPy = Join-Path $BITNET_DIR "3rdparty\llama.cpp\gguf-py"
-    if (Test-Path $ggufPy) {
-        Write-Info "Installing BitNet Python dependencies..."
-        Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "-e", $ggufPy) -LastLineOnly
+    if (Test-Path (Join-Path $ggufPy "setup.py")) {
+        Write-Info "Installing gguf-py from submodule..."
+        Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "-e", $ggufPy) -LastLineOnly -IgnoreExitCode
     }
-    $bitnetReqs = Join-Path $BITNET_DIR "requirements.txt"
-    if (Test-Path $bitnetReqs) {
-        Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "-r", $bitnetReqs) -LastLineOnly
+    # Verify gguf is importable; install from PyPI if not
+    $ggufCheck = & $venvPython -c "import gguf" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Info "Installing gguf from PyPI as fallback..."
+        Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "gguf") -LastLineOnly
     }
     Invoke-NativeCommand -FilePath $pipExe -Arguments @("install", "huggingface_hub") -LastLineOnly
 
